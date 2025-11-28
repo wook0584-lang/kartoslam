@@ -26,11 +26,9 @@
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/qos.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
-#include "tf2/exceptions.h"
+#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "tf2/utils.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
-#include "tf2_ros/buffer.h"
-#include "tf2_ros/transform_listener.h"
 
 #include "localize_karto/Grid.h"
 #include "localize_karto/Pose.h"
@@ -51,6 +49,7 @@ public:
 
 private:
   void laserCallback(const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan);
+  void initialPoseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr & msg);
   bool getLaserPose(karto::Pose2 & karto_pose, const rclcpp::Time & stamp, const std::string & frame_id);
   karto::LaserRangeFinder * getLaser(const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan);
   bool addScan(const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan, karto::Pose2 & karto_pose);
@@ -59,8 +58,9 @@ private:
   void handleMapMessage(const nav_msgs::msg::OccupancyGrid & msg);
   void convertMap(const nav_msgs::msg::OccupancyGrid & map_msg);
 
-  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
-  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub_;
+  karto::Pose2 manual_pose_;
+  bool has_manual_pose_;
 
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr laser_subscription_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_subscription_;
@@ -91,7 +91,8 @@ SlamKarto::SlamKarto()
   scanmatcher_(nullptr),
   m_pCorrelationGrid_(nullptr),
   first_map_received_(false),
-  laser_count_(0)
+  laser_count_(0),
+  has_manual_pose_(false)
 {
   odom_frame_ = this->declare_parameter<std::string>("odom_frame", "odom");
   map_frame_ = this->declare_parameter<std::string>("map_frame", "map");
@@ -107,8 +108,10 @@ SlamKarto::SlamKarto()
     odom_frame_.c_str(),
     base_frame_.c_str());
 
-  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
-  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+  initial_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+    "initialpose",
+    10,
+    std::bind(&SlamKarto::initialPoseCallback, this, std::placeholders::_1));
 
   laser_subscription_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
     "scan",
@@ -136,7 +139,7 @@ SlamKarto::SlamKarto()
   mapper_->setParamCorrelationSearchSpaceDimension(correlation_search_space_dimension);
 
   double correlation_search_space_resolution =
-    this->declare_parameter<double>("correlation_search_space_resolution", 0.01);
+    this->declare_parameter<double>("correlation_search_space_resolution", 0.1);
   mapper_->setParamCorrelationSearchSpaceResolution(correlation_search_space_resolution);
 
   double correlation_search_space_smear_deviation =
@@ -156,11 +159,11 @@ SlamKarto::SlamKarto()
   mapper_->setParamFineSearchAngleOffset(fine_search_angle_offset);
 
   double coarse_search_angle_offset =
-    this->declare_parameter<double>("coarse_search_angle_offset", 0.349);
+    this->declare_parameter<double>("coarse_search_angle_offset", M_PI);     // 0.349   360도 간격으로 
   mapper_->setParamCoarseSearchAngleOffset(coarse_search_angle_offset);
 
   double coarse_angle_resolution =
-    this->declare_parameter<double>("coarse_angle_resolution", 0.0349);
+    this->declare_parameter<double>("coarse_angle_resolution", 5.0* M_PI/180.0);   // 0.0349 5도 간격으로
   mapper_->setParamCoarseAngleResolution(coarse_angle_resolution);
 
   double minimum_angle_penalty =
@@ -207,55 +210,40 @@ SlamKarto::getLaser(const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan)
   return lasers_[scan->header.frame_id];
 }
 
-bool
-SlamKarto::getLaserPose(karto::Pose2 & karto_pose, const rclcpp::Time & stamp, const std::string & frame_id)
+void
+SlamKarto::initialPoseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr & msg)
 {
-  geometry_msgs::msg::PoseStamped ident;
-  ident.header.stamp = stamp;
-  ident.header.frame_id = frame_id;
-  ident.pose.orientation.w = 1.0;
+  double yaw = tf2::getYaw(msg->pose.pose.orientation);
+  manual_pose_ = karto::Pose2(
+    msg->pose.pose.position.x,
+    msg->pose.pose.position.y,
+    yaw);
+  has_manual_pose_ = true;
+  
+  RCLCPP_INFO(
+    this->get_logger(), 
+    "Received Initial Pose: x=%.3f, y=%.3f, theta=%.3f", 
+    manual_pose_.GetX(), manual_pose_.GetY(), manual_pose_.GetHeading());
+}
 
-  geometry_msgs::msg::PoseStamped laser_pose;
-  bool transformed = false;
-  try {
-    laser_pose = tf_buffer_->transform(ident, map_frame_);
-    transformed = true;
-  } catch (const tf2::ExtrapolationException & ex) {
-    RCLCPP_WARN(
-      this->get_logger(),
-      "TF at stamp %.6f unavailable for %s (%s); retrying with latest data.",
-      stamp.seconds(),
-      frame_id.c_str(),
-      ex.what());
-  } catch (const tf2::TransformException & ex) {
-    RCLCPP_WARN(this->get_logger(), "Failed to compute pose for %s: %s", frame_id.c_str(), ex.what());
+bool
+SlamKarto::getLaserPose(karto::Pose2 & karto_pose, const rclcpp::Time & /*stamp*/, const std::string & /*frame_id*/)
+{
+  if (!has_manual_pose_) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000,
+      "Waiting for initial pose from RViz (2D Pose Estimate)...");
     return false;
   }
 
-  if (!transformed) {
-    geometry_msgs::msg::PoseStamped latest_request = ident;
-    latest_request.header.stamp = rclcpp::Time(0, 0, stamp.get_clock_type());
-    try {
-      laser_pose = tf_buffer_->transform(latest_request, map_frame_);
-      RCLCPP_WARN(this->get_logger(), "Using latest TF data for %s (requested stamp %.6f lagged)", frame_id.c_str(), stamp.seconds());
-    } catch (const tf2::TransformException & ex) {
-      RCLCPP_WARN(this->get_logger(), "Latest transform lookup failed for %s: %s", frame_id.c_str(), ex.what());
-      return false;
-    }
-  }
-
-  double yaw = tf2::getYaw(laser_pose.pose.orientation);
-
-  karto_pose =
-    karto::Pose2(
-    laser_pose.pose.position.x,
-    laser_pose.pose.position.y,
-    yaw);
-  RCLCPP_INFO(
-    this->get_logger(), "laser pose: x = %f, y = %f, yaw = %f ",
-    laser_pose.pose.position.x,
-    laser_pose.pose.position.y,
-    yaw);
+  // Use the manually set pose directly (assuming laser offset is 0 as requested)
+  karto_pose = manual_pose_;
+  
+  RCLCPP_DEBUG(
+    this->get_logger(), "Using manual laser pose: x = %f, y = %f, yaw = %f ",
+    karto_pose.GetX(),
+    karto_pose.GetY(),
+    karto_pose.GetHeading());
 
   return true;
 }
@@ -403,7 +391,7 @@ SlamKarto::convertMap(const nav_msgs::msg::OccupancyGrid & map_msg)
   int occupied_cells = 0;
   int unknown_cells = 0;
 
-  const std::size_t total_cells = map_msg.data.size();
+  const std::size_t total_cells = map_msg.info.width * map_msg.info.height;
   for (std::size_t i = 0; i < total_cells; ++i) {
     const auto cell = map_msg.data[i];
     if (cell == 0) {
