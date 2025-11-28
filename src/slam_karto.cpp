@@ -122,7 +122,7 @@ SlamKarto::SlamKarto()
   map_qos.transient_local();
   map_qos.reliable();
   map_subscription_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
-    "map",
+    "test/map",
     map_qos,
     std::bind(&SlamKarto::mapReceived, this, std::placeholders::_1));
   RCLCPP_INFO(this->get_logger(), "Subscribed to map topic.");
@@ -139,7 +139,7 @@ SlamKarto::SlamKarto()
   mapper_->setParamCorrelationSearchSpaceDimension(correlation_search_space_dimension);
 
   double correlation_search_space_resolution =
-    this->declare_parameter<double>("correlation_search_space_resolution", 0.1);
+    this->declare_parameter<double>("correlation_search_space_resolution", 0.1);  //0.01m 10cm
   mapper_->setParamCorrelationSearchSpaceResolution(correlation_search_space_resolution);
 
   double correlation_search_space_smear_deviation =

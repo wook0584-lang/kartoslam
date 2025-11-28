@@ -763,12 +763,10 @@ ScanMatcher::~ScanMatcher()
   {
     kt_double response = 0.0;
 
-    std::cout<<"To get the score!!!"<<std::endl;
-
     // add up value for each point
     kt_int8u* pByte = m_pCorrelationGrid->GetDataPointer() + gridPositionIndex;
 
-    std::cout<<"*pByte"<< *pByte <<std::endl;
+    // std::cout<<"*pByte"<< *pByte <<std::endl;  // pByte는 gridPositionIndex에 대한 포인터
 
     const LookupArray* pOffsets = m_pGridLookup->GetLookupArray(angleIndex);
     assert(pOffsets != NULL);
@@ -802,8 +800,8 @@ ScanMatcher::~ScanMatcher()
 
     // normalize response
     response /= (nPoints * GridStates_Occupied);
-
-    std::cout<< "The score is = " << response << std::endl;
+    // 일단 지움 
+    // std::cout<< "The score is = " << response << std::endl;
 
     assert(fabs(response) <= 1.0);
 
